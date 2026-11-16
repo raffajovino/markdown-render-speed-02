@@ -463,6 +463,8 @@ function emitPlain(str, i, j, b, ops, delims, inLink) {
       }
     }
     const start = r.start, end = r.end;
+    // a trimmed-to-empty autolink must not stall the scan (no forward progress)
+    if (end <= start || end <= pos) { escRange(str, pos, k + 1, ops); pos = k + 1; continue; }
     // preceding char must be start / whitespace / punctuation
     if (start > 0) {
       const pc = str.charCodeAt(start - 1);
@@ -592,6 +594,7 @@ function scanDelim(str, i, b, a, ops, delims) {
   const ph = {
     t: OP_DELIM, ch, len: L, olen: L, canOpen, canClose, active: true,
     open: [], close: [], pos: i, blocked: false, linkId: 0,
+    blocksLookback: 0, litBefore: 0,
   };
   ops.push(ph);
   delims.push(ph);
@@ -606,13 +609,40 @@ function processEmphasis(delims) {
     if (!closer.active || !closer.canClose || closer.len === 0) { i++; continue; }
     if (closer.ch === 126 && closer.len >= 3) { i++; continue; } // ~~~ never strikes
     // look back for an opener
-    let j = i - 1, found = false, blockedEm = false;
+    let j = i - 1, found = false;
+    // set when a pairing attempt is refused by the block (not by rule of 3
+    // or by finding no opener): such a closer leaves the stack
+    let blockedAttempt = false;
+    // blocks crossed in this lookback, by the inner pair's use: a block of
+    // use U forbids a later pairing of the OTHER use across it
+    let blockedBy1 = false, blockedBy2 = false;
+    // blocks crossed behind a live close-only delimiter (same char): such a
+    // block still forbids a use-1 pairing across it, but not a use-2 one
+    let shieldedBy1 = false, shieldedBy2 = false;
+    // a live close-only delimiter (same char) shields blocks beyond it
+    let shielded = false;
+    // blocked delimiters crossed (their flags clear on a block decision)
+    const crossed = [];
     while (j >= 0) {
       const opener = delims[j];
-      // a delimiter flagged by a strong open-only/both pair blocks an <em>
-      // (use 1) pairing across it for this closer only (one shot: clear the
-      // flag so a later closer can pass); a <strong> (use 2) pairing may pass
-      if (opener.blocksLookback && opener.ch === closer.ch) { opener.blocksLookback = false; blockedEm = true; j--; continue; }
+      // a close-only delimiter shields even after it failed as a closer
+      // (a failed closer leaves the stack, so active must not be required)
+      if (opener.ch === closer.ch && opener.len > 0 && opener.canClose && !opener.canOpen && !opener.blocked) {
+        shielded = true;
+      }
+      // a delimiter flagged by an open-only/both pair blocks a pairing of a
+      // different use across it; the flag clears when a pairing decision is
+      // made across it (a block refusal or an allowed pairing), not when the
+      // lookback merely passes it (rule-of-3 skips do not clear it)
+      if (opener.blocksLookback && opener.ch === closer.ch) {
+        if (shielded) {
+          if (opener.blocksLookback === 1) shieldedBy1 = true; else shieldedBy2 = true;
+        } else {
+          if (opener.blocksLookback === 1) blockedBy1 = true; else blockedBy2 = true;
+        }
+        crossed.push(opener);
+        j--; continue;
+      }
       // a delimiter inside a formed pair, or inside a different link, cannot
       // pair with this closer (it would cross an emphasis / link boundary)
       if (opener.blocked || opener.linkId !== closer.linkId) { j--; continue; }
@@ -626,13 +656,43 @@ function processEmphasis(delims) {
           if (sum % 3 === 0 && (opener.len % 3 !== 0 || closer.len % 3 !== 0)) { j--; continue; }
         }
         const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
-        if (blockedEm && use === 1) { j--; continue; }
+        // a shielded block forbids a use-1 pairing across it but not a use-2 one
+        const blockedDiff = (use === 1 && (blockedBy2 || shieldedBy2)) || (use === 2 && blockedBy1);
+        const blockedSame = (use === 1 && (blockedBy1 || shieldedBy1)) || (use === 2 && (blockedBy2 || shieldedBy2));
+        if (blockedDiff) {
+          // pairing across a block of a different use: refused, unless the
+          // closer run has length >= 3 (then it forces through, the excess
+          // delimiters rendering literally inside the element). The block is
+          // consumed only by a refused use-2 (strong) attempt or by a pairing
+          // that forms across it; a refused use-1 attempt leaves it standing
+          // for a later closer (marked: doc-11 vs "**a *b*c**d**e**")
+          if (use === 2) {
+            for (const d of crossed) d.blocksLookback = 0;
+            crossed.length = 0;
+          }
+          if (closer.len >= 3) {
+            closer.litBefore = (closer.litBefore || 0) + (closer.len - use);
+            closer.len = use;
+          } else {
+            blockedAttempt = true;
+            j--; continue;
+          }
+        } else if (blockedSame) {
+          // same-use pairing across a block: allowed only when it fully
+          // consumes the opener (use == opener.len)
+          if (use !== opener.len) { blockedAttempt = true; j--; continue; }
+          for (const d of crossed) d.blocksLookback = 0;
+          crossed.length = 0;
+        }
+        for (const d of crossed) d.blocksLookback = 0;
+        crossed.length = 0;
         const tag = closer.ch === 126 ? 'del' : use === 2 ? 'strong' : 'em';
-        // a strong pair whose opener is open-only and whose closer can both
-        // open and close blocks the NEXT closer's lookback past it (one shot):
-        // marked leaves the outer delimiter literal in "*a **b**c*"
-        if (use === 2 && opener.canOpen && !opener.canClose && closer.canOpen && closer.canClose) {
-          closer.blocksLookback = true;
+        // a pair whose opener is open-only and whose closer can both open
+        // and close blocks a later pairing of a different use across it:
+        // marked leaves the outer delimiter literal in "*a **b**c*" and in
+        // "**a *b*c**"
+        if (opener.canOpen && !opener.canClose && closer.canOpen && closer.canClose) {
+          closer.blocksLookback = use;
         }
         opener.open.push('<' + tag + '>');
         closer.close.push('</' + tag + '>');
@@ -654,7 +714,11 @@ function processEmphasis(delims) {
       j--;
     }
     if (!found && closer.len > 0) {
-      // no opener (or closer still unmatched after exhausting openers): move on
+      // no opener (or closer still unmatched after exhausting openers): move on.
+      // A closer refused by the block leaves the stack, so a later closer
+      // may not pair with it as an opener; a closer that merely found no
+      // opener stays (it may still open, e.g. "foo*bar*").
+      if (blockedAttempt && closer.close.length === 0) closer.active = false;
     }
     i++;
   }
@@ -678,6 +742,7 @@ function renderOps(ops, out) {
     if (op.t === OP_AUTOLINK) { out.push(op.html); continue; }
     if (op.t === OP_DELIM) {
       const ch = String.fromCharCode(op.ch);
+      if (op.litBefore) out.push(ch.repeat(op.litBefore));
       for (const t of op.close) out.push(t);
       if (op.len > 0) out.push(ch.repeat(op.len));
       for (let x = op.open.length - 1; x >= 0; x--) out.push(op.open[x]);
@@ -1115,12 +1180,16 @@ function trimAutolinkEnd(str, a, e) {
     if (e <= a) break;
     const c = str.charCodeAt(e - 1);
     if (c === 41) { // )
-      let open = 0, close = 0;
-      for (let k = a; k < e; k++) {
-        if (str.charCodeAt(k) === 40) open++;
-        else if (str.charCodeAt(k) === 41) close++;
+      // boolean-depth scan: '(' opens (depth 1), ')' closes only when depth
+      // is 1 (a nested '(' is ignored, so a((b)) ends at a((b), not a((b)));
+      // a trailing ')' matches only when depth is 1 before it
+      let depth = 0;
+      for (let k = a; k < e - 1; k++) {
+        const cc = str.charCodeAt(k);
+        if (cc === 40) depth = 1;
+        else if (cc === 41 && depth === 1) depth = 0;
       }
-      if (close > open) { e--; continue; }
+      if (depth === 0) { e--; continue; }
       break;
     }
     if (c === 59) { // ; — drop the whole entity-looking &xxx; (the URL ends
