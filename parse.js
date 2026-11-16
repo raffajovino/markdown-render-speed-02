@@ -1777,6 +1777,18 @@ function splitTableRow(text) {
           q += m - 1;
         }
         if (hasClose) inCode = n;
+        else {
+          // no same-length close: this run and the next backtick run (of any
+          // length) are one mismatched literal (e.g. ``many`), so consume
+          // the next run too instead of letting it open a span and swallow
+          // the '|' separators
+          let q = k + n, nx = -1, nm = 0;
+          while (q < s.length) {
+            if (s.charCodeAt(q) === 96) { nx = q; while (q + nm < s.length && s.charCodeAt(q + nm) === 96) nm++; break; }
+            q++;
+          }
+          if (nx >= 0) { cur += s.slice(k, nx + nm); k = nx + nm - 1; continue; }
+        }
       } else if (n === inCode) inCode = 0;
       cur += s.slice(k, k + n);
       k += n - 1;
